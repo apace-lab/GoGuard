@@ -1277,8 +1277,7 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				is_sender := state.Dir == types.SendOnly
 
 				switch val := state.Chan.(type) {
-				case *ssa.UnOp:
-					//channel := val.X
+				case *ssa.UnOp, *ssa.Extract:
 					channel := val
 					g.updateChannelPTS(channel, h.cur_cgnode)
 					// normal cases or when the above pts is empty
@@ -3600,6 +3599,9 @@ func getCaseBBs(select_bb *ssa.BasicBlock, h *creatorHelper, is_blocking bool) m
 				// if jump back, it is the end of current case
 				h.skips[succ] = true
 				tmp = append(tmp, succ)
+				if succ.Comment == "select.done" {
+					continue // current select finishes here
+				}
 				succs = append(succs, succ.Succs...) // push
 			}
 		}
