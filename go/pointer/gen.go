@@ -13,7 +13,7 @@ package pointer
 import (
 	"fmt"
 	"github.com/bozhen-liu/gopa/container/intsets"
-	"github.com/bozhen-liu/gopa/go/myutil/flags"
+	"github.com/bozhen-liu/gopa/flags"
 	"github.com/bozhen-liu/gopa/go/ssa"
 	"go/token"
 	"go/types"
@@ -421,6 +421,7 @@ func (a *analysis) makeCGNodeAndRelated(fn *ssa.Function, caller *cgnode, caller
 				if goInstr != nil { //case 2: create one with only target, make closure is not ssa.CallInstruction
 					special := &callsite{targets: obj, loopID: loopID, goInstr: goInstr}
 					fnkcs = a.createKCallSite(caller.callersite, special)
+					a.numOrigins++ // here will trigger the go later
 				} else { // use parent context, since no go invoke afterwards (no go can be reachable currently at this point);
 					//update: we will update the parent ctx (including loopID) after solving
 					if !a.consumeMakeClosureNext(closure) { //only record if next instr is go -> context changes afterwards
@@ -437,7 +438,7 @@ func (a *analysis) makeCGNodeAndRelated(fn *ssa.Function, caller *cgnode, caller
 				}
 				fnkcs := a.createKCallSite(caller.callersite, special)
 				cgn = &cgnode{fn: fn, obj: obj, callersite: fnkcs}
-				a.numOrigins++ //only here really trigger the go
+				a.numOrigins++ // here really trigger the go
 
 				//origins = append(origins, cgn.String())
 				//fmt.Println(cgn.String()) //bz: debug

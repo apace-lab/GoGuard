@@ -3,7 +3,7 @@ package concurrency
 import (
 	"bufio"
 	"fmt"
-	"github.com/bozhen-liu/gopa/go/myutil/flags"
+	"github.com/bozhen-liu/gopa/flags"
 	"github.com/bozhen-liu/gopa/go/pointer"
 	"github.com/bozhen-liu/gopa/go/ssa"
 	"go/token"
@@ -17,13 +17,16 @@ import (
 // bz: Resource Flow Graph Implementation
 
 var (
-	DEBUG             = false // print out a large amount of info
-	DEBUG_EACH_RESULT = false // print out result for each detection right after its detection
-
+	DEBUG              = false
+	DEBUG_GRAPH        = false                    // only print out rfg
+	DEBUG_GRAPH_RW     = false                    // print out each rwnode in printgraph
+	DEBUG_RW           = false                    // print out rw instructions when building graphs
+	DEBUG_EACH_RESULT  = false                    // print out result for each detection right after its detection
 	ID                 = 0                        // increment for id of the node in rfg
+	ID_RW              = 0                        // increment for id of the rwnode in rfgplus
 	EXPLORE_ALL_STATES = true                     // split and explore all states
 	limit              = 3                        // see g.visited
-	RANDOM_STATE       = true                     // use
+	RANDOM_STATE       = true                     // use for GoGuard
 	scopePkg           = "command-line-arguments" // default value
 )
 
@@ -40,6 +43,11 @@ func inScopePkg(fn *ssa.Function) bool {
 	for _, f := range considerFns {
 		if fn.String() == f {
 			return true
+		}
+	}
+	for _, f := range flags.ExcludedPkgs {
+		if strings.Contains(fn.String(), f) {
+			return false
 		}
 	}
 
@@ -92,6 +100,9 @@ const (
 	NCONDWait
 	NSignal
 	NBroadcast
+
+	// for detecting data race
+	NRW
 )
 
 // Node goroutine node
@@ -118,7 +129,7 @@ type Node struct {
 	ch_close_inst ssa.Instruction // can be ssa.Defer or ssa.Call
 
 	// for loop
-	loop_name string          // name of this loop = "loc@bb idx" (use the bb idx with for.body) TODO: use its loc, e.g., pos@cgnode?
+	loop_name string          // name of this loop = "loc@bb idx" (use the bb idx with for.body) TODO: use its loc, e.g., pos@cgnode
 	loop_bb   *ssa.BasicBlock // the bb entering a loop
 	enterLoop bool            // true if this is entering this loop
 
@@ -129,10 +140,10 @@ type Node struct {
 	roc_ch   *ssa.Value // the receiving channel
 
 	// for select
-	sel_name   string      // name of the select and its cases or ssa.Value?
-	sel_inst   *ssa.Select // instruction of this select
-	cases      []*Node     // all cases of this select
-	is_in_loop bool        // whether this select is in a loop
+	sel_name       string      // name of the select and its cases or ssa.Value?
+	sel_inst       *ssa.Select // instruction of this select
+	cases          []*Node     // all cases of this select
+	is_in_for_loop bool        // whether this select is in a for loop
 
 	// for select case: reuse isSender and ch_ptr
 	case_ch_name string           // name of the case
@@ -140,6 +151,9 @@ type Node struct {
 	case_to_end  bool             // whether this case leads to exit of loop only when it's in a loop
 	case_state   *ssa.SelectState // state from select, will be nil if default
 	default_inst ssa.Instruction  // the 1st instruction of default block,
+
+	// for select case: others
+	select_node_id int // the select_node_id if this node is from a select case, default = 0
 
 	// for function call
 	fn_name string // callee name
@@ -167,6 +181,9 @@ type Node struct {
 	wg_done_inst ssa.Instruction // Done(): call or defer
 	seen_done    bool            // NOTE: used in detection, mark true when seen this wg.Done()
 
+	// for waitgroup: defer wg.Done() -> use exit to indicate the Done instead of creating a wg node
+	isWGDone bool // also len(wg_pts) > 0
+
 	// for cond: reuse wait_inst
 	cond_ptr       ssa.Value
 	signal_inst    *ssa.Call
@@ -181,8 +198,11 @@ type Node struct {
 	// for copy
 	is_copy bool
 
-	// others
-	select_node_id int // the select_node_id if this node is from a select case, default = 0
+	// for read and write
+	rws []*RWNode // a sequence of read/write nodes between two synchronization points in a goroutine
+
+	// for goroutines spawned in a loop -> determine the happens-before relation
+	hip []int // gid/tid all of which nodes can happen in parallel with this node
 }
 
 func copyDeferNodes(defer_nodes []*Node, g *RFGraph) []*Node {
@@ -229,7 +249,7 @@ func (n *Node) Copy(g *RFGraph) *Node {
 }
 
 // String format = Node + id + (type of Node): name
-func (n *Node) String() string {
+func (n Node) String() string {
 	s := fmt.Sprintf("Node%d ", n.id)
 	switch n.typId {
 	case NLock:
@@ -313,12 +333,28 @@ func (n *Node) String() string {
 		s += "(wg.done): @" + n.wg_done_inst.String()
 	case NExit:
 		s += "(exit)"
+		if n.isWGDone {
+			s += " (serve as defer wg.Done())"
+		}
 	case NCONDWait:
 		s += "(cond.wait): @" + n.cond_ptr.String()
 	case NSignal:
 		s += "(signal): @" + n.cond_ptr.String()
 	case NBroadcast:
 		s += "(broadcast): @" + n.cond_ptr.String()
+	case NRW:
+		s += "(read/write): ["
+		if DEBUG_GRAPH_RW {
+			s += "\n"
+			for j, rwn := range n.rws {
+				if j == len(n.rws)-1 {
+					s += fmt.Sprintf("\t%d. %s\n", j, rwn.String())
+					continue
+				}
+				s += fmt.Sprintf("\t%d. %s\n", j, rwn.String())
+			}
+		}
+		s += "]"
 	default:
 	}
 	if n.from_defer {
@@ -354,7 +390,7 @@ type RFGraph struct {
 	prog *ssa.Program
 
 	roots   []*Node           // thread start node, including main
-	adjList map[*Node][]*Node // parent -> kids
+	adjList map[*Node][]*Node // parent -> kids: only threads and consecutive nodes' relations
 	id2node map[int]*Node
 
 	// for graph creation
@@ -373,12 +409,36 @@ type RFGraph struct {
 	// a map = <t1, t2>
 	tid2end map[int]*Node // for wg.Wait(): which thread match NExit or NWGDone
 
-	// for detection
+	// for blocking bug detection
 	resources  map[int]*ProducerConsumer // resources to its producers and consumers
 	states     []*detectionState         // summary of all explored states
 	tid2wg_pts map[int][]int             // this goroutine calls wg.Done() and need to update at the exit
 	cferrs     []*CFError                // for store control flow error result
 	berrs      []*BlockError             // for store blocking error result
+
+	// for data race detection
+	rfgplus        *RFGPlusGraph
+	holding_locks  map[int]map[int]bool // gid to [its lock objs to whether still holding (true)]
+	holding_rlocks map[int]map[int]bool // gid to [its rlock objs to whether still holding (true)]
+	cache          map[string]bool      // cache of happens-before relations
+	syncAdjList    map[*Node][]*Node    // parent -> kids: happens-before among synchronization primitives, e.g., channels
+
+	inst2rwnode map[ssa.Instruction]*RWNode // record the instruction to its corresponding rwnode,
+	// TODO: this is a tmp inefficient and memory-consuming solution for handling the write to field's field
+	//    e.g., istio8214 with its IR:
+	//  t0 = &c.stats [#0]                                               *Stats
+	//  t1 = &t0.Writes [#0]                                            *uint64
+	//  t2 = sync/atomic.AddUint64(t1, 1:uint64)                         uint64
+	//  OR we reversely traverse graph to find the node corresponding to the inst? but also inefficient
+
+	// // the following feature seems wrong ... tmp keep it here
+	//obj2mdarrs map[int][]int // record the obj/pointer id of a multi-d array and its enclosing pointers/objs for all its dimensions
+	//// this is to resolve the multi-d array access e.g., moby22941
+	//// obj of pts of the most inner array -> multi-d array pointers
+	//// whenever there is access to such an obj, we add accesses to its multi-d array pointers
+
+	// for determining hb relation of nodes created by goroutines spawned in a loop and loop body
+	gid2nloop map[int]map[int]int // gid/tid -> node ids created in a loop with range [key, value]
 }
 
 // Statistics reports #states #goroutine #channel #lock #ctx #wg #cond #ROC #select
@@ -400,15 +460,40 @@ func (g *RFGraph) Statistics() map[int]int {
 			nums[5]++
 		case NSelect:
 			nums[6]++
+		case NRW:
+			nums[11]++
+			for _, rwn := range n.rws {
+				switch rwn.typID {
+				case NRead:
+					nums[9]++
+				case NWrite:
+					nums[10]++
+				}
+			}
 		}
 	}
 
 	fmt.Println("\n\n***********************************\nRFG Statistics")
-	fmt.Printf("#states = %d #goroutine = %d #channel = %d #lock = %d #ctx = %d #wg = %d #cond = %d #ROC = %d #select = %d\n",
-		len(g.states), len(g.roots), nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6])
-	fmt.Println("***********************************")
+	fmt.Printf("#states = %d #goroutine = %d #channel = %d #lock = %d #ctx = %d #wg = %d #cond = %d #ROC = %d #select = %d #rwn = %d #reads = %d #writes = %d\n",
+		len(g.states), len(g.roots), nums[0], nums[1], nums[2], nums[3], nums[4], nums[5], nums[6], nums[11], nums[9], nums[10])
 	nums[7] = len(g.states)
 	nums[8] = len(g.roots)
+
+	if flags.DoRace {
+		nums[12] = len(g.rfgplus.races)
+		if flags.Plus {
+			nums[13] = g.rfgplus.size_edge
+			nums[14] = g.rfgplus.size_node
+		}
+		nums[15] = len(g.rfgplus.obj2WriteNode)
+		nums[16] = len(g.rfgplus.obj2ReadNode)
+		nums[17] = len(g.rfgplus.pts2WriteNode)
+		nums[18] = len(g.rfgplus.pts2ReadNode)
+
+		fmt.Printf("#races = %d, #rfgplusedge = %d, #rfgplusnode = %d, #obj2write = %d, #obj2read = %d, #pts2write = %d, #pts2read = %d\n",
+			nums[12], nums[13], nums[14], nums[15], nums[16], nums[17], nums[18])
+	}
+	fmt.Println("***********************************")
 
 	return nums
 }
@@ -420,17 +505,42 @@ func InitializeRFG() *RFGraph {
 	}
 
 	return &RFGraph{
-		adjList:    make(map[*Node][]*Node),
-		id2node:    make(map[int]*Node),
-		visited:    make(map[string]int),
-		contexts:   make(map[int]*Pair),
-		alias:      make(map[int]int),
-		tid2end:    make(map[int]*Node),
-		resources:  make(map[int]*ProducerConsumer),
-		tid2wg_pts: make(map[int][]int),
-		cferrs:     make([]*CFError, 0),
-		berrs:      make([]*BlockError, 0),
+		adjList:        make(map[*Node][]*Node),
+		id2node:        make(map[int]*Node),
+		visited:        make(map[string]int),
+		contexts:       make(map[int]*Pair),
+		alias:          make(map[int]int),
+		tid2end:        make(map[int]*Node),
+		resources:      make(map[int]*ProducerConsumer),
+		tid2wg_pts:     make(map[int][]int),
+		cferrs:         make([]*CFError, 0),
+		berrs:          make([]*BlockError, 0),
+		rfgplus:        InitializeRFGPlus(),
+		holding_locks:  make(map[int]map[int]bool),
+		holding_rlocks: make(map[int]map[int]bool),
+		cache:          make(map[string]bool),
+		syncAdjList:    make(map[*Node][]*Node),
+		inst2rwnode:    make(map[ssa.Instruction]*RWNode),
+		//obj2mdarrs:     make(map[int][]int),
+		gid2nloop: make(map[int]map[int]int),
 	}
+}
+
+// isDuplicateState return true if we have this state already
+func (g *RFGraph) isDuplicateState(state *detectionState) bool {
+	// if the last two nodes in a state repeat, it's dead ... don't explore again
+	// e.g., moby4951
+	if hasRepeatState(state.splitting_points) {
+		return true
+	}
+
+	for _, s := range g.states {
+		if IntArrayContains(s.splitting_points, state.splitting_points) ||
+			IntMapContains(s.pairs, state.pairs) {
+			return true
+		}
+	}
+	return false
 }
 
 // updateNodes update id2node, append to adjList then increment ID
@@ -454,6 +564,9 @@ func (g *RFGraph) updateNodes(prev_node, cur_node *Node, skip_append bool) {
 // getPTS get pts from pts result with ctx
 func (g *RFGraph) getPTS(key ssa.Value, cgnode *pointer.Node) []int {
 	ptr := g.pa.PointsToByContext(key, cgnode.GetContext())
+	if _, ok := key.(*ssa.Global); ok {
+		return g.pa.GetGlobalVarID(&ptr) // we use global var itself as pts instead of querying its pts
+	}
 	pts := ptr.PointsTo().GetPTS() // pts = {obj, ... }
 	// replace with alias
 	for i, obj := range pts {
@@ -462,6 +575,27 @@ func (g *RFGraph) getPTS(key ssa.Value, cgnode *pointer.Node) []int {
 		}
 	}
 	return pts
+}
+
+func (g *RFGraph) computeLockset(gid int) []int {
+	ret := make([]int, 0)
+	//for key, lock := range g.holding_locks {
+	//	pts := g.getPTS(key, lock.cgnode)
+	//	ret = append(ret, pts...)
+	//}
+
+	for obj, ok := range g.holding_locks[gid] {
+		if ok {
+			ret = append(ret, obj)
+		}
+	}
+	for obj, ok := range g.holding_rlocks[gid] {
+		if ok {
+			ret = append(ret, obj)
+		}
+	}
+
+	return ret
 }
 
 // UpdateResources during rfg creation
@@ -475,6 +609,83 @@ func (g *RFGraph) UpdateResources(key ssa.Value, cgnode *pointer.Node, node *Nod
 			continue
 		}
 		g.UpdateResourcesInner(obj, node)
+	}
+
+	if flags.DoRace && !node.from_defer {
+		g.UpdateLockset(node)
+	}
+}
+
+// UpdateLockset for race detection only: maintain lockset here;
+// TODO: NOTE THAT key might be different for the same pair of lock/unlock
+func (g *RFGraph) UpdateLockset(node *Node) {
+	if node.lock_ptr == nil {
+		return
+	}
+
+	pts := g.getPTS(node.lock_ptr, node.cgnode) // find pts
+	gid := node.gid
+
+	switch node.typId {
+	case NLock:
+		if _, ok := g.holding_locks[gid]; !ok {
+			g.holding_locks[gid] = make(map[int]bool)
+		}
+		for _, obj := range pts {
+			g.holding_locks[gid][obj] = true
+		}
+		if DEBUG {
+			fmt.Printf("------> holding lock: key = %s, node = %s, pts = %d\n", node.lock_ptr.String(), node.String(), pts)
+		}
+	case NRLock:
+		if _, ok := g.holding_rlocks[gid]; !ok {
+			g.holding_rlocks[gid] = make(map[int]bool)
+		}
+		for _, obj := range pts {
+			g.holding_rlocks[gid][obj] = true
+		}
+		if DEBUG {
+			fmt.Printf("------> holding rlock: key = %s, node = %s, pts = %d\n", node.lock_ptr.String(), node.String(), pts)
+		}
+	case NUnlock:
+		if _, ok := g.holding_locks[gid]; ok {
+			for _, obj := range pts {
+				if hold, ok2 := g.holding_locks[gid][obj]; ok2 && hold {
+					g.holding_locks[gid][obj] = false
+				} else {
+					if DEBUG {
+						fmt.Printf("------> No matching key in holding_locks: key = %s\n", node.lock_ptr.String())
+					}
+				}
+			}
+			if DEBUG {
+				fmt.Printf("------> removing lock: key = %s, node = %s, pts = %d\n", node.lock_ptr.String(), node.String(), pts)
+			}
+		} else {
+			if DEBUG {
+				fmt.Printf("------> No matching key in holding_locks: key = %s\n", node.lock_ptr.String())
+			}
+		}
+	case NRUnlock:
+		if _, ok := g.holding_rlocks[gid]; ok {
+			for _, obj := range pts {
+				if hold, ok2 := g.holding_rlocks[gid][obj]; ok2 && hold {
+					g.holding_rlocks[gid][obj] = false
+				} else {
+					if DEBUG {
+						fmt.Printf("------> No matching key in holding_rlocks: key = %s\n", node.lock_ptr.String())
+					}
+				}
+			}
+			if DEBUG {
+				fmt.Printf("------> removing lock: key = %s, node = %s, pts = %d\n", node.lock_ptr.String(), node.String(), pts)
+			}
+		} else {
+			if DEBUG {
+				fmt.Printf("------> No matching key in holding_rlocks: key = %s\n", node.lock_ptr.String())
+			}
+		}
+	default:
 	}
 }
 
@@ -506,7 +717,7 @@ func (g *RFGraph) UpdateResourcesInner(obj int, node *Node) {
 //		t2 = make chan struct{} 0:int     chan struct{}  -> used locally
 //	 *t1 = t2
 //
-// pta cannot capture this ... have to capture here:
+// pta cannot capture this ... i have to capture here:
 func (g *RFGraph) updateChannelPTS(ch ssa.Value, cur_cgnode *pointer.Node) {
 	pts := g.getPTS(ch, cur_cgnode)
 	for _, obj := range pts {
@@ -519,10 +730,12 @@ func (g *RFGraph) updateChannelPTS(ch ssa.Value, cur_cgnode *pointer.Node) {
 }
 
 // getChannelPtrForValue(AndUpdateChannelPTS) due to different channel types in *ssa.XXX
-func (g *RFGraph) getChannelPtrForValue(val ssa.Value) ssa.Value {
+func (g *RFGraph) getChannelPtrForValue(val ssa.Value, cur_cgnode *pointer.Node) ssa.Value {
 	var ch ssa.Value
 	switch ext := val.(type) {
 	case *ssa.UnOp:
+		//ch = ext.X
+		//g.updateChannelPTS(ch, cur_cgnode)
 		ch = ext
 	case *ssa.Call, *ssa.MakeChan:
 		ch = ext
@@ -539,12 +752,12 @@ func (g *RFGraph) getChannelPtrForValue(val ssa.Value) ssa.Value {
 }
 
 // getChannelPtrForInst(AndUpdateChannelPTS) due to different channel types in *ssa.XXX
-func (g *RFGraph) getChannelPtrForInst(inst *ssa.Send) ssa.Value {
+func (g *RFGraph) getChannelPtrForInst(inst *ssa.Send, cur_cgnode *pointer.Node) ssa.Value {
 	var ch ssa.Value
 	if _, ok := inst.Chan.(*ssa.Extract); ok {
 		ch = inst.X
 	} else {
-		ch = g.getChannelPtrForValue(inst.Chan)
+		ch = g.getChannelPtrForValue(inst.Chan, cur_cgnode)
 	}
 	return ch
 }
@@ -554,44 +767,10 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 	if h.skips[bb] || bb.Comment == "recover" || onlyDeferReturn(bb) { // handled
 		return prev_node
 	}
+	h.skips[bb] = true // e.g., kubernetes82239 where select follow with another select inside a loop.
+	// we add bb to h.skips here to avoid recursive visit of the statements in the loop
+
 	cur_node := prev_node
-	if bb.Comment == "for.body" || bb.Comment == "rangeindex.loop" {
-		cur_node = &Node{
-			id:        ID,
-			typId:     NLoop,
-			cgnode:    h.cur_cgnode,
-			parent_id: parent_node.id,
-			gid:       h.cur_tid,
-			loop_name: "loop@" + bb.String() + h.cur_cgnode.GetFunc().String(),
-			loop_bb:   bb,
-			enterLoop: true,
-		}
-
-		// updateNodes
-		g.updateNodes(prev_node, cur_node, false)
-		h.is_in_loop = true
-		h.loop_name = cur_node.loop_name
-		prev_node = cur_node
-
-	} else if bb.Comment == "rangechan.loop" {
-		cur_node = &Node{
-			id:        ID,
-			typId:     NROC,
-			cgnode:    h.cur_cgnode,
-			parent_id: parent_node.id,
-			gid:       h.cur_tid,
-			roc_name:  "roc@" + bb.String() + h.cur_cgnode.GetFunc().String(),
-			roc_bb:    bb,
-			enterROC:  true,
-		}
-
-		// updateNodes
-		g.updateNodes(prev_node, cur_node, false)
-		h.is_in_roc = true
-		h.roc_name = cur_node.roc_name
-		prev_node = cur_node
-
-	}
 
 	// when returning a receive-only channel
 	returnChannel := func(inst *ssa.UnOp, j int) bool {
@@ -677,6 +856,12 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 	// for normal calls
 	// inst == nil when called by defer
 	traverseCallee := func(inst *ssa.Call, site *ssa.CallCommon) {
+		//if inst != nil && h.isWrappedInFn(inst) {
+		//	// see isWrappedInFn
+		//	// if called by defer, no need to check
+		//	return
+		//}
+
 		callees := h.cur_cgnode.GetCalleeByCommon(site)
 		if DEBUG && len(callees) > 1 {
 			fmt.Printf("!!!! %s has multiple callees %s\n", h.cur_cgnode, callees)
@@ -697,7 +882,7 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 	}
 
 	createChannelClose := func(site *ssa.CallCommon, inst ssa.Instruction) *Node {
-		ch := g.getChannelPtrForValue(site.Args[0])
+		ch := g.getChannelPtrForValue(site.Args[0], h.cur_cgnode)
 		c := &Node{
 			id:            ID,
 			typId:         NClose,
@@ -751,13 +936,14 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 			gid:         h.cur_tid,
 			unlock_inst: inst,
 			lock_ptr:    ptr,
+			from_defer:  skip_append, // update here
 		}
 		g.updateNodes(prev_node, unlock, skip_append)
 		g.UpdateResources(ptr, h.cur_cgnode, unlock)
 		return unlock
 	}
 
-	// when there is no defer
+	// when no defer
 	updateWGDone := func(site *ssa.CallCommon, inst ssa.Instruction) *Node {
 		ptr := site.Args[0]
 		pts := g.getPTS(ptr, h.cur_cgnode) // get pts here, otherwise wrong pointer
@@ -795,6 +981,8 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 			}
 			exit.wg_pts = wg_pts
 			exit.gid = tid
+			// update exit node
+			exit.isWGDone = true
 		}
 	}
 
@@ -804,13 +992,16 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 		}
 
 		switch inst := instr.(type) {
-		case *ssa.Go: // TODO: recursive creation for the same go site, currently we don't consider such cases
+		case *ssa.Go: // TODO: recursive creation for the same go site
 			// we dont check scope here
 			site := inst.Common()
 			callees := h.cur_cgnode.GetCalleeByCommon(site)
 
-			if h.is_in_loop { // has 2 callees when in loop
-				for _, callee := range callees {
+			if h.is_in_for_loop || h.is_in_loop || h.is_in_roc {
+				// pointer analysis gives 2 callees (go1 and go2) when in the loop
+				// after go1 spawn, the instructions in current bb (which creates the loop)
+				// can happen in parallel with go1's instructions when preparing the spawn of go2
+				for i, callee := range callees {
 					if !g.doVisit(inst, callee, h) {
 						break
 					}
@@ -825,6 +1016,11 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 					}
 					g.updateNodes(last_node, exit, false)
 					updateWGExit(g_parent_node.gid, exit)
+
+					// update for hb
+					if flags.DoRace && i == 0 {
+						h.gid1st = append(h.gid1st, last_node.gid)
+					}
 				}
 				break
 			}
@@ -842,7 +1038,7 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 
 				g_parent_node, last_node := g.DFS(callee, prev_node, inst, true)
 				checkCtxCancel(inst, inst.Call, last_node) // this might be context.cancel()
-				if last_node.is_in_loop {
+				if last_node.is_in_for_loop {
 					// TODO: link the exit to the loop exit node e.g., cockroach2448
 				}
 				exit := &Node{
@@ -862,7 +1058,7 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 			// Note: we may have multiple rundefer in one function, and then the deferred nodes make a loop
 			// e.g., cockroach7504, (cockroach10214)
 			// we copy the defer node each time we see rundefer to avoid circular dependency
-			copies := copyDeferNodes(h.defer_nodes, g)
+			copies := copyDeferNodes(h.defer_closes, g)
 			if len(copies) > 0 {
 				for i := len(copies) - 1; i >= 0; i-- {
 					defer_node := copies[i]
@@ -873,6 +1069,19 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 					prev_node = defer_node
 				}
 			}
+
+			copies = copyDeferNodes(h.defer_unlocks, g)
+			if len(copies) > 0 {
+				for i := len(copies) - 1; i >= 0; i-- {
+					defer_node := copies[i]
+					if prev_node == defer_node { // recursion, e.g., grpc3017
+						continue
+					}
+					g.adjList[prev_node] = append(g.adjList[prev_node], defer_node)
+					prev_node = defer_node
+				}
+			}
+
 			if len(h.defer_calls) > 0 {
 				// visit the fn here
 				for i := len(h.defer_calls) - 1; i >= 0; i-- {
@@ -891,21 +1100,19 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 			switch name {
 			case "Unlock":
 				unlock := createUnlockNode(&inst.Call, inst, NUnlock, true)
-				unlock.from_defer = true
-				h.defer_nodes = append(h.defer_nodes, unlock)
+				h.defer_unlocks = append(h.defer_unlocks, unlock)
 				break
 
 			case "RUnlock":
 				unlock := createUnlockNode(&inst.Call, inst, NRUnlock, true)
-				unlock.from_defer = true
-				h.defer_nodes = append(h.defer_nodes, unlock)
+				h.defer_unlocks = append(h.defer_unlocks, unlock)
 				break
 
 			case "close":
 				if inst.Call.Value.String() == "builtin close" {
 					c := createChannelClose(&inst.Call, inst)
 					g.updateNodes(prev_node, c, true)
-					h.defer_nodes = append(h.defer_nodes, c)
+					h.defer_closes = append(h.defer_closes, c)
 				} else {
 					h.defer_calls = append(h.defer_calls, &inst.Call)
 				}
@@ -914,6 +1121,11 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 			case "Done":
 				if strings.HasPrefix(inst.Call.String(), "(*sync.WaitGroup).Done") { // from waitgroup.Done()
 					// handled by updateWGExit
+					//done_node := updateWGDone(&inst.Call, inst)
+					//h.defer_unlocks = append(h.defer_unlocks, done_node)
+					ptr := inst.Call.Args[0]
+					pts := g.getPTS(ptr, h.cur_cgnode) // get pts here, otherwise wrong pointer
+					g.tid2wg_pts[h.cur_tid] = pts
 				} else {
 					h.defer_calls = append(h.defer_calls, &inst.Call)
 				}
@@ -961,7 +1173,7 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				}
 				break
 
-			case "close":
+			case "close": // close channel
 				if inst.Call.Value.String() == "builtin close" {
 					cur_node = createChannelClose(&inst.Call, inst)
 					g.updateNodes(prev_node, cur_node, false)
@@ -1028,36 +1240,46 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				traverseCallee(inst, inst.Common())
 				break
 
-			case "Signal": // for (*sync.Cond).Signal
-				ptr := inst.Call.Args[0]
-				cur_node = &Node{
-					id:          ID,
-					typId:       NSignal,
-					cgnode:      h.cur_cgnode,
-					parent_id:   parent_node.id,
-					gid:         h.cur_tid,
-					cond_ptr:    ptr, // the free var
-					signal_inst: inst,
+			case "Signal":
+				if strings.HasPrefix(inst.Call.String(), "(*sync.Cond).Signal") { // (*sync.Cond).Signal
+					ptr := inst.Call.Args[0]
+					cur_node = &Node{
+						id:          ID,
+						typId:       NSignal,
+						cgnode:      h.cur_cgnode,
+						parent_id:   parent_node.id,
+						gid:         h.cur_tid,
+						cond_ptr:    ptr, // the free var
+						signal_inst: inst,
+					}
+					g.updateNodes(prev_node, cur_node, false)
+					g.UpdateResources(ptr, h.cur_cgnode, cur_node)
+					prev_node = cur_node
+					break
 				}
-				g.updateNodes(prev_node, cur_node, false)
-				g.UpdateResources(ptr, h.cur_cgnode, cur_node)
-				prev_node = cur_node
+				// normal calls
+				traverseCallee(inst, inst.Common())
 				break
 
-			case "Broadcast": // (*sync.Cond).Broadcast
-				ptr := inst.Call.Args[0]
-				cur_node = &Node{
-					id:             ID,
-					typId:          NBroadcast,
-					cgnode:         h.cur_cgnode,
-					parent_id:      parent_node.id,
-					gid:            h.cur_tid,
-					cond_ptr:       ptr, // the free var
-					broadcast_inst: inst,
+			case "Broadcast":
+				if strings.HasPrefix(inst.Call.String(), "(*sync.Cond).Broadcast") { // (*sync.Cond).Broadcast
+					ptr := inst.Call.Args[0]
+					cur_node = &Node{
+						id:             ID,
+						typId:          NBroadcast,
+						cgnode:         h.cur_cgnode,
+						parent_id:      parent_node.id,
+						gid:            h.cur_tid,
+						cond_ptr:       ptr, // the free var
+						broadcast_inst: inst,
+					}
+					g.updateNodes(prev_node, cur_node, false)
+					g.UpdateResources(ptr, h.cur_cgnode, cur_node)
+					prev_node = cur_node
+					break
 				}
-				g.updateNodes(prev_node, cur_node, false)
-				g.UpdateResources(ptr, h.cur_cgnode, cur_node)
-				prev_node = cur_node
+				// normal calls
+				traverseCallee(inst, inst.Common())
 				break
 
 			case "Done":
@@ -1068,6 +1290,9 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 					cur_node = updateWGDone(&inst.Call, inst)
 					prev_node = cur_node
 					break
+					//} else if checkCtxCancel(inst, inst.Call, prev_node) {
+					//} else if checkCtxDone(j) {
+					//	break
 				}
 				// normal calls
 				traverseCallee(inst, inst.Common())
@@ -1093,14 +1318,44 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				traverseCallee(inst, inst.Common())
 				break
 
-			case "AfterFunc": // its makeclosure runs in a new goroutine, e.g., grpc3017
-				// TODO: give the makeclosure a new context
+			case "AfterFunc": // is time.AfterFunc(), its makeclosure runs in a new goroutine, e.g., grpc3017
+				// TODO: give the makeclosure a new context in pointer analysis
 				mc_inst := inst.Call.Args[1]
 				pts := g.getPTS(mc_inst, h.cur_cgnode)
 				for _, obj := range pts {
 					mc_fn := g.pa.GetCalleeByID(obj)
 					if g.doVisit(inst, mc_fn, h) {
 						_, cur_node = g.DFS(mc_fn, cur_node, inst, true)
+					}
+				}
+				break
+
+			case "Range":
+				if strings.HasPrefix(inst.Call.String(), "(*sync.Map).Range") { // (*sync.Map).Range(t1, t2)
+					// its makeclosure (i.e., t2) is the function that runs now in the same thread, e.g., istio8144
+					mc_inst := inst.Call.Args[1]
+					pts := g.getPTS(mc_inst, h.cur_cgnode)
+					for _, obj := range pts {
+						mc_fn := g.pa.GetCalleeByID(obj)
+						if g.doVisit(inst, mc_fn, h) {
+							_, cur_node = g.DFS(mc_fn, cur_node, inst, false)
+						}
+					}
+					break
+				}
+				// normal calls
+				traverseCallee(inst, inst.Common())
+				break
+
+			case "delete", "AddUint32", "AddUint64", "AddInt32", "AddInt64":
+				// delete key from map
+				// atomic.AddUint64(&c.stats.Writes, 1)
+				// TODO: add other functions in atomic package
+				if flags.DoRace {
+					rw_node := g.VisitRWNode(instr, prev_node, parent_node, h)
+					if rw_node != nil {
+						cur_node = rw_node
+						prev_node = cur_node
 					}
 				}
 				break
@@ -1112,9 +1367,17 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 			break
 
 		case *ssa.Return:
-			if h.is_in_loop { // for now, the return is only important when it's in a loop
+			if flags.DoRace {
+				rw_node := g.VisitRWNode(instr, prev_node, parent_node, h)
+				if rw_node != nil {
+					cur_node = rw_node
+					prev_node = cur_node
+				}
+			}
+
+			if h.is_in_for_loop { // for now, the return is only important when it's in a loop
 				// we avoid the naming pattern, but use r and e
-				// ofter called by select cases
+				// often called by select cases
 				r := &Node{ // return
 					id:        ID,
 					typId:     NReturn,
@@ -1125,14 +1388,14 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				}
 				g.updateNodes(prev_node, r, false)
 
-				// link to a loop exit node
+				// link to a for loop exit node
 				cur_node = &Node{ // exit
 					id:        ID,
 					typId:     NLoop,
 					cgnode:    h.cur_cgnode,
 					parent_id: parent_node.id,
 					gid:       h.cur_tid,
-					loop_name: h.loop_name,
+					loop_name: h.for_loop_name,
 					enterLoop: false,
 				}
 				g.updateNodes(r, cur_node, false)
@@ -1151,6 +1414,17 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				}
 				g.updateNodes(prev_node, r, false)
 
+				//// link to a roc exit node
+				//cur_node = &Node{ // exit
+				//	id:        ID,
+				//	typId:     NROC,
+				//	cgnode:    h.cur_cgnode,
+				//	parent_id: parent_node.id,
+				//	gid:       h.cur_tid,
+				//	roc_name:  h.roc_name,
+				//	enterROC:  false,
+				//}
+				//g.updateNodes(r, cur_node, false)
 				prev_node = r
 			}
 			break
@@ -1172,7 +1446,7 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				g.UpdateResources(channel, h.cur_cgnode, cur_node)
 			}
 
-			ch := g.getChannelPtrForInst(inst)
+			ch := g.getChannelPtrForInst(inst, h.cur_cgnode)
 			g.updateChannelPTS(ch, h.cur_cgnode)
 			createSendNode(ch)
 			prev_node = cur_node
@@ -1204,19 +1478,25 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				g.updateNodes(prev_node, cur_node, false)
 				g.UpdateResources(channel, h.cur_cgnode, cur_node)
 				prev_node = cur_node
-			} // else are not important
+			} else if flags.DoRace {
+				rw_node := g.VisitRWNode(instr, prev_node, parent_node, h)
+				if rw_node != nil {
+					cur_node = rw_node
+					prev_node = cur_node
+				}
+			}
 			break
 
 		case *ssa.Select:
 			cur_node = &Node{
-				id:         ID,
-				typId:      NSelect,
-				cgnode:     h.cur_cgnode,
-				parent_id:  parent_node.id,
-				gid:        h.cur_tid,
-				sel_name:   "select@" + inst.String(),
-				sel_inst:   inst,
-				is_in_loop: h.is_in_loop,
+				id:             ID,
+				typId:          NSelect,
+				cgnode:         h.cur_cgnode,
+				parent_id:      parent_node.id,
+				gid:            h.cur_tid,
+				sel_name:       "select@" + inst.String(),
+				sel_inst:       inst,
+				is_in_for_loop: h.is_in_for_loop,
 			}
 			g.updateNodes(prev_node, cur_node, false)
 			h.select_node_id = cur_node.id // for later marks
@@ -1264,9 +1544,9 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 
 					// see if existing a bb that contains a return to stop the loop
 					// or other interesting statements
-					if h.is_in_loop && _cur_node.typId == NLoop && _cur_node.enterLoop == false {
+					if h.is_in_for_loop && _cur_node.typId == NLoop && _cur_node.enterLoop == false {
 						// this node lead to end of path
-						// TODO: any other possibilities?
+						// TODO: other possibilities?
 						c.case_to_end = true
 					}
 				}
@@ -1404,6 +1684,9 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 				completeCaseNode(c, size-1)
 			}
 
+			//if h.is_in_for_loop { // we handled the loop body already, can exit the loop now
+			//	h.is_in_for_loop = false
+			//}
 			prev_node = cur_node
 			h.select_node_id = -1
 			break
@@ -1411,6 +1694,13 @@ func (g *RFGraph) DFSBB(bb *ssa.BasicBlock, parent_node, prev_node *Node, h *cre
 		default:
 			if DEBUG {
 				fmt.Printf("%s %T\n", inst, inst)
+			}
+			if flags.DoRace {
+				rw_node := g.VisitRWNode(instr, prev_node, parent_node, h)
+				if rw_node != nil {
+					cur_node = rw_node
+					prev_node = cur_node
+				}
 			}
 		}
 
@@ -1433,18 +1723,24 @@ func isCtxDone(inst ssa.Instruction) (*ssa.Call, bool) {
 type creatorHelper struct {
 	cur_cgnode     *pointer.Node
 	skips          map[*ssa.BasicBlock]bool
-	is_in_loop     bool
-	loop_name      string // define when seeing "for.body"
-	is_in_roc      bool
+	is_in_for_loop bool   // for "for" loop only
+	for_loop_name  string // define when seeing "for.body"
+	is_in_roc      bool   // for roc only
 	roc_name       string // define when seeing "rangechan.loop"
+	is_in_loop     bool   // including "rangeindex.loop" and "rangeiter.loop"
+	loop_name      string // define when seeing "rangeindex.loop" and "rangeiter.loop"
 	cur_tid        int    // current tid
 	select_node_id int    // the select_node_id if this is from a select case, default = -1; only in the belonging function, do not inherent
 
+	// for gid2nloop: record the 1st gids/tids spawned in current loop
+	gid1st []int
+
 	// for unexpected exit of control flow
-	has_lock    bool
-	has_wg      bool
-	defer_nodes []*Node           // stack of defer insts
-	defer_calls []*ssa.CallCommon // stack of defer fn calls
+	has_lock      bool
+	has_wg        bool
+	defer_unlocks []*Node           // stack of defer insts
+	defer_closes  []*Node           // stack of defer channel close
+	defer_calls   []*ssa.CallCommon // stack of defer fn calls
 }
 
 // isWrappedInFn is makeclosure/function call wrapped in a function parameter which is called later
@@ -1502,6 +1798,7 @@ func (h *creatorHelper) isWrappedInFn(inst *ssa.Call) bool {
 }
 
 // DFS for creating graph: only called by the start of main or goroutines or function entries
+// isThread: start a new thread
 // return parent_node and prev_node
 func (g *RFGraph) DFS(cur_cgnode *pointer.Node, parent *Node, creation_site ssa.CallInstruction, isThread bool) (*Node, *Node) {
 	var parent_node *Node
@@ -1579,10 +1876,10 @@ func (g *RFGraph) DFS(cur_cgnode *pointer.Node, parent *Node, creation_site ssa.
 	}
 
 	h := &creatorHelper{
-		cur_cgnode: cur_cgnode,
-		skips:      make(map[*ssa.BasicBlock]bool), // skip the traversal for consumed "select.body"
-		is_in_loop: false,                          // TODO: inherent loop?
-		cur_tid:    parent_node.gid,
+		cur_cgnode:     cur_cgnode,
+		skips:          make(map[*ssa.BasicBlock]bool), // skip the traversal for consumed "select.body" and loop bodies
+		is_in_for_loop: false,                          // TODO: inherent loop?
+		cur_tid:        parent_node.gid,
 	}
 
 	// traverse the instructions in cur_cgnode with different scenarios:
@@ -1602,18 +1899,87 @@ func (g *RFGraph) DFS(cur_cgnode *pointer.Node, parent *Node, creation_site ssa.
 		if DEBUG {
 			fmt.Println("=> bb: " + bb.String() + " #" + bb.Comment)
 		}
-		cur_node = g.DFSBB(bb, prev_node, prev_node, h) // traverse each basic block (BB)
 
+		// since for all types of loops, "xxx.body" contains the statements inside the loop
+		// we need to check whether it's a "for.body" before entering DFSBB
+		// if so, collect all bbs (including bb itself) for this loop body first
+		if bb.Comment == "for.body" {
+			cur_node = &Node{
+				id:        ID,
+				typId:     NLoop,
+				cgnode:    h.cur_cgnode,
+				parent_id: parent_node.id,
+				gid:       h.cur_tid,
+				loop_name: "loop@" + bb.String() + h.cur_cgnode.GetFunc().String(),
+				loop_bb:   bb,
+				enterLoop: true,
+			}
+
+			// updateNodes
+			g.updateNodes(prev_node, cur_node, false)
+			h.is_in_for_loop = true
+			h.for_loop_name = cur_node.loop_name
+			prev_node = cur_node
+
+		} else if bb.Comment == "rangechan.loop" {
+			cur_node = &Node{
+				id:        ID,
+				typId:     NROC,
+				cgnode:    h.cur_cgnode,
+				parent_id: parent_node.id,
+				gid:       h.cur_tid,
+				roc_name:  "roc@" + bb.String() + h.cur_cgnode.GetFunc().String(),
+				roc_bb:    bb,
+				enterROC:  true,
+			}
+
+			// updateNodes
+			g.updateNodes(prev_node, cur_node, false)
+			h.is_in_roc = true
+			h.roc_name = cur_node.roc_name
+			prev_node = cur_node
+		} else if bb.Comment == "rangeindex.loop" || bb.Comment == "rangeiter.loop" {
+			cur_node = &Node{
+				id:        ID,
+				typId:     NLoop,
+				cgnode:    h.cur_cgnode,
+				parent_id: parent_node.id,
+				gid:       h.cur_tid,
+				loop_name: "loop@" + bb.String() + h.cur_cgnode.GetFunc().String(),
+				loop_bb:   bb,
+				enterLoop: true,
+			}
+
+			// updateNodes
+			g.updateNodes(prev_node, cur_node, false)
+			h.is_in_loop = true
+			h.loop_name = cur_node.loop_name
+			prev_node = cur_node
+		} else {
+			cur_node = g.DFSBB(bb, prev_node, prev_node, h) // traverse each basic block (BB)
+		}
+
+		// for blocking bug: previously, we care about roc only
+		// for races: we care about all types of loops
 		if h.is_in_roc {
 			// visit the roc bbs
 			prev_node = cur_node
-			bodies := getROCBBs(bb, h)
+			nid_start := prev_node.id
+			bodies := getLoopBBs(bb, h)
 			for _, body := range bodies {
-				cur_node = g.DFSBB(body, prev_node, prev_node, h) // TODO: which parent_node can look better?
+				cur_node = g.DFSBB(body, prev_node, prev_node, h) // TODO: who should be parent_node that looks better?
 				if cur_node != nil {
 					prev_node = cur_node
 				}
 			}
+			nid_end := prev_node.id
+			for _, gid := range h.gid1st {
+				if _, ok := g.gid2nloop[gid]; !ok {
+					g.gid2nloop[gid] = make(map[int]int)
+				}
+				g.gid2nloop[gid][nid_start] = nid_end
+			}
+			h.gid1st = nil // do i have to clear?
 
 			// link to a roc exit node
 			cur_node = &Node{ // exit
@@ -1631,12 +1997,92 @@ func (g *RFGraph) DFS(cur_cgnode *pointer.Node, parent *Node, creation_site ssa.
 			// finish the process of roc
 			h.is_in_roc = false
 			continue
+		} else if h.is_in_loop {
+			// visit the loop bbs
+			prev_node = cur_node
+			nid_start := prev_node.id
+			bodies := getLoopBBs(bb, h)
+			for _, body := range bodies {
+				cur_node = g.DFSBB(body, prev_node, prev_node, h) // TODO: who should be parent_node that looks better?
+				if cur_node != nil {
+					prev_node = cur_node
+				}
+			}
+			nid_end := prev_node.id
+			for _, gid := range h.gid1st {
+				if _, ok := g.gid2nloop[gid]; !ok {
+					g.gid2nloop[gid] = make(map[int]int)
+				}
+				g.gid2nloop[gid][nid_start] = nid_end
+			}
+			h.gid1st = nil // do i have to clear?
+
+			// link to a loop exit node
+			cur_node = &Node{ // exit
+				id:        ID,
+				typId:     NLoop,
+				cgnode:    h.cur_cgnode,
+				parent_id: parent_node.id,
+				gid:       h.cur_tid,
+				loop_name: h.loop_name,
+				enterROC:  false,
+			}
+			g.updateNodes(prev_node, cur_node, false)
+			prev_node = cur_node
+
+			// finish the process of roc
+			h.is_in_loop = false
+			continue
+		} else if h.is_in_for_loop {
+			// visit the for loop bbs
+			prev_node = cur_node
+			nid_start := prev_node.id
+			bodies := getLoopBBs(bb, h)
+			for _, body := range bodies {
+				cur_node = g.DFSBB(body, prev_node, prev_node, h) // TODO: who should be parent_node that looks better?
+				if cur_node != nil {
+					prev_node = cur_node
+				}
+			}
+			nid_end := prev_node.id
+			for _, gid := range h.gid1st {
+				if _, ok := g.gid2nloop[gid]; !ok {
+					g.gid2nloop[gid] = make(map[int]int)
+				}
+				g.gid2nloop[gid][nid_start] = nid_end
+			}
+			h.gid1st = nil // do i have to clear?
+			// some exits of for loop already handled
+			// link to a loop exit node
+			cur_node = &Node{ // exit
+				id:        ID,
+				typId:     NLoop,
+				cgnode:    h.cur_cgnode,
+				parent_id: parent_node.id,
+				gid:       h.cur_tid,
+				loop_name: h.loop_name,
+				enterROC:  false,
+			}
+			g.updateNodes(prev_node, cur_node, false)
+			prev_node = cur_node
+
+			// finish the process of roc
+			h.is_in_for_loop = false
+			continue
 		}
 
 		if cur_node != nil {
 			prev_node = cur_node
 		} else if DEBUG {
 			fmt.Println("?? nil cur_node")
+		}
+	}
+
+	// for race detection only: release the deferred lock now
+	if flags.DoRace && len(h.defer_unlocks) > 0 {
+		for i := len(h.defer_unlocks) - 1; i >= 0; i-- {
+			defer_node := h.defer_unlocks[i]
+			g.UpdateLockset(defer_node)
 		}
 	}
 
@@ -1694,6 +2140,9 @@ func getSig(site ssa.CallInstruction, callee *pointer.Node, tid int) string {
 // TODO: we only consider the app functions for now
 func (g *RFGraph) doVisit(site ssa.CallInstruction, callee *pointer.Node, h *creatorHelper) bool {
 	if callee != nil && callee.GetFunc() != nil && inScopePkg(callee.GetFunc()) {
+		//if h != nil && (h.is_in_for_loop || h.is_in_roc) {
+		//	return true
+		//}
 		sig := getSig(site, callee, h.cur_tid)
 		visited_num := g.visited[sig]
 		if visited_num < limit {
@@ -1705,12 +2154,22 @@ func (g *RFGraph) doVisit(site ssa.CallInstruction, callee *pointer.Node, h *cre
 }
 
 // hasInterestingInsts
+// TODO: adjust interesting insts all the time
 func (g *RFGraph) hasInterestingInsts(bbs []*ssa.BasicBlock) bool {
+	isInteresting := func(instr ssa.Instruction) bool {
+		switch instr.(type) {
+		case *ssa.Go, *ssa.Select, *ssa.Send, *ssa.Defer, *ssa.Call, *ssa.MakeClosure, *ssa.MakeChan, *ssa.UnOp:
+			return true
+		case *ssa.Store, *ssa.FieldAddr, *ssa.Lookup, *ssa.ChangeType, *ssa.MapUpdate, *ssa.MakeInterface:
+			return flags.DoRace // for race detection only
+		default:
+			return false
+		}
+	}
+
 	for _, bb := range bbs {
 		for _, instr := range bb.Instrs {
-			switch instr.(type) {
-			// TODO: adjust interesting insts all the time
-			case *ssa.Go, *ssa.Select, *ssa.Send, *ssa.Defer, *ssa.Call, *ssa.MakeClosure, *ssa.MakeChan, *ssa.UnOp:
+			if isInteresting(instr) {
 				return true
 			}
 		}
@@ -1751,8 +2210,11 @@ func (g *RFGraph) CreateGraph(ptResult *pointer.ResultWCtx, prog *ssa.Program, e
 		fmt.Println("Finish building RFG for main entry: " + entry.String())
 	}
 
-	if DEBUG {
+	if DEBUG || DEBUG_GRAPH {
 		g.PrintGraph() // debug
+		if flags.DoRace {
+			g.rfgplus.PrintRecords()
+		}
 	}
 }
 
@@ -1762,7 +2224,7 @@ func (g *RFGraph) prettyPrintTree(node *Node, indent string) {
 	}
 
 	fmt.Println(indent+"->", node.String())
-	indent += ""
+	indent += "  "
 	if node.typId == NSelect {
 		// print its cases as kid
 		for _, c := range node.cases {
@@ -1807,6 +2269,259 @@ func (g *RFGraph) PrintGraph() {
 		}
 	}
 }
+
+// recursiveFindFieldAddr check doc for inst2rwnode for detail
+func (g *RFGraph) recursiveFindFieldAddr(v ssa.Value) {
+	if fa, ok := v.(*ssa.FieldAddr); ok {
+		if f, ok2 := fa.X.(*ssa.FieldAddr); ok2 {
+			for _, inst := range *f.Referrers() {
+				// update these insts' rwnodes to be write
+				if rwnode, ok3 := g.inst2rwnode[inst]; ok3 {
+					rwnode.typID = NWrite
+					// update g.obj2WriteNode and g.obj2ReadNode
+					if DEBUG {
+						fmt.Printf("changing read to write: %s ... \n", rwnode.String())
+					}
+					g.rfgplus.ChangeRead2Write(rwnode)
+				}
+			}
+			g.recursiveFindFieldAddr(f)
+		}
+	}
+}
+
+// recursiveFindIndexAddr TODO: same as recursiveFindFieldAddr
+func (g *RFGraph) recursiveFindIndexAddr(v ssa.Value) {
+	if fa, ok := v.(*ssa.IndexAddr); ok {
+		if f, ok2 := fa.X.(*ssa.IndexAddr); ok2 {
+			for _, inst := range *f.Referrers() {
+				// update these insts' rwnodes to be write
+				if rwnode, ok3 := g.inst2rwnode[inst]; ok3 {
+					rwnode.typID = NWrite
+					// update g.obj2WriteNode and g.obj2ReadNode
+					if DEBUG {
+						fmt.Printf("changing read to write: %s ... \n", rwnode.String())
+					}
+					g.rfgplus.ChangeRead2Write(rwnode)
+				}
+			}
+			g.recursiveFindFieldAddr(f)
+		}
+	}
+}
+
+// VisitRWNode for detecting race
+func (g *RFGraph) VisitRWNode(instr ssa.Instruction, prev_node, parent_node *Node, h *creatorHelper) *Node {
+	var rwn *RWNode
+	switch inst := instr.(type) {
+	case *ssa.Store:
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NWrite,
+			inst:    inst,
+			pts:     g.getPTS(inst.Addr, h.cur_cgnode),
+			lockset: g.computeLockset(h.cur_tid),
+		}
+	case *ssa.UnOp:
+		switch inst.Op {
+		case token.MUL: // load
+			rwn = &RWNode{
+				id:      ID_RW,
+				typID:   NRead,
+				inst:    inst,
+				pts:     g.getPTS(inst.X, h.cur_cgnode), // ?
+				lockset: g.computeLockset(h.cur_tid),
+			}
+		case token.XOR, token.SUB, token.NOT: // self write
+			rwn = &RWNode{
+				id:      ID_RW,
+				typID:   NWrite,
+				inst:    inst,
+				pts:     g.getPTS(inst.X, h.cur_cgnode), // ?
+				lockset: g.computeLockset(h.cur_tid),
+			}
+		default: // channel receive
+		}
+	case *ssa.MapUpdate:
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NWrite,
+			inst:    inst,
+			pts:     g.getPTS(inst.Map, h.cur_cgnode), // TODO: use Key for better precision?
+			lockset: g.computeLockset(h.cur_tid),
+		}
+	case *ssa.Slice:
+		// Note: when you create a new slice from an existing slice using slicing syntax, such as a = b[1:] (e.g., moby22941),
+		// Go does not create a new underlying array. Instead, it creates a new slice header that points to the original array.
+		// This means that a and b share the same underlying array, but they have different slice headers.
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NWrite,
+			inst:    inst,
+			pts:     g.getPTS(inst.X, h.cur_cgnode),
+			lockset: g.computeLockset(h.cur_tid),
+		}
+
+		//for _, arr_obj := range rwn.pts {
+		//	// mark its corresponding multi-d array pts's objs as write
+		//	if mdarr_objs, ok := g.obj2mdarrs[arr_obj]; ok {
+		//		rwn.pts = append(rwn.pts, mdarr_objs...)
+		//		rwn.mdarr_objs = append(rwn.mdarr_objs, mdarr_objs...)
+		//	}
+		//}
+
+	case *ssa.Call: // TODO: consider other functions
+		name := inst.Call.Value.Name()
+		if inst.Call.Method != nil { // is abstract invoke
+			name = inst.Call.Method.Name()
+		}
+		switch name {
+		case "delete", "AddUint32", "AddUint64", "AddInt32", "AddInt64": // write to the first argument
+			rwn = &RWNode{
+				id:      ID_RW,
+				typID:   NWrite,
+				inst:    inst,
+				pts:     g.getPTS(inst.Call.Args[0], h.cur_cgnode),
+				lockset: g.computeLockset(h.cur_tid),
+			}
+			g.recursiveFindFieldAddr(inst.Call.Args[0])
+		default: // read on return value
+			rwn = &RWNode{
+				id:      ID_RW,
+				typID:   NRead,
+				inst:    inst,
+				pts:     g.getPTS(inst, h.cur_cgnode),
+				lockset: g.computeLockset(h.cur_tid),
+			}
+		}
+
+	case *ssa.Field: // load
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NRead,
+			inst:    inst,
+			pts:     g.getPTS(inst.X, h.cur_cgnode),
+			field:   inst.Field,
+			lockset: g.computeLockset(h.cur_tid),
+		}
+	case *ssa.FieldAddr:
+		// if inst.X is still ssa.FieldAddr, we recursively record all of them
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NRead,
+			inst:    inst,
+			pts:     g.getPTS(inst.X, h.cur_cgnode),
+			field:   inst.Field,
+			lockset: g.computeLockset(h.cur_tid),
+		}
+		g.recursiveFindFieldAddr(inst.X)
+	case *ssa.Lookup:
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NRead,
+			inst:    inst,
+			pts:     g.getPTS(inst.X, h.cur_cgnode), // ?
+			lockset: g.computeLockset(h.cur_tid),
+		}
+	case *ssa.Index: // for array
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NRead,
+			inst:    inst,
+			pts:     g.getPTS(inst.X, h.cur_cgnode), // ?
+			lockset: g.computeLockset(h.cur_tid),
+		}
+	case *ssa.IndexAddr: // for array
+
+		// TODO: this also has the same problem as *ssa.FieldAddr when there is a write using this pointer later
+		rwn = &RWNode{
+			id:      ID_RW,
+			typID:   NRead,
+			inst:    inst,
+			pts:     g.getPTS(inst.X, h.cur_cgnode), // ?
+			lockset: g.computeLockset(h.cur_tid),
+		}
+
+		// // if inst.X is still ssa.IndexAddr, we recursively record all of them,
+		// // since we may have multi-dimensional array/slice, e.g., moby22941
+		//for _, oid := range rwn.pts { // a (multi-d) array pointer
+		//	mdarr_objs := g.pa.GetMultiDArrayObjs(oid)
+		//	// for now, only the most inner array's pts is available,
+		//	// TODO: other possibilities?
+		//	for _, arr_id := range mdarr_objs {
+		//		arr_pts := g.pa.GetPTSByPtrID(arr_id)
+		//		if arr_pts != nil && len(arr_pts) > 0 {
+		//			for _, arr_obj := range arr_pts {
+		//				// whenever there is access to such an obj,
+		//				// we add accesses to its multi-d array pointers
+		//				g.obj2mdarrs[arr_obj] = mdarr_objs
+		//			}
+		//		}
+		//	}
+		//}
+	case *ssa.Return: // special case: it can create multiple rwnodes -> recursively call myself to create nodes
+		for _, ret := range inst.Results {
+			switch rinst := ret.(type) {
+			case ssa.Instruction:
+				g.VisitRWNode(rinst, prev_node, parent_node, h)
+			}
+		}
+	// // the following are too strict, introduce (duplicate) races with no source code
+	//case *ssa.ChangeType: // similar to cast
+	//	rwn = &RWNode{
+	//		id:      ID_RW,
+	//		typID:   NRead,
+	//		inst:    inst,
+	//		pts:     g.getPTS(inst.X, h.cur_cgnode), // ?
+	//		lockset: g.computeLockset(h.cur_tid),
+	//	}
+	//case *ssa.MakeInterface: // similar to cast
+	//	rwn = &RWNode{
+	//		id:      ID_RW,
+	//		typID:   NRead,
+	//		inst:    inst,
+	//		pts:     g.getPTS(inst.X, h.cur_cgnode),
+	//		lockset: g.computeLockset(h.cur_tid),
+	//	}
+	//case *ssa.Extract: //?
+	//case *ssa.Alloc: // ?
+	//	if inst.Heap { // is on heap
+	//	}
+	default: // nothing
+	}
+	if rwn != nil {
+		var cur_node *Node
+		if prev_node.rws == nil { // when prev_node is a synchronization primitive
+			cur_node = &Node{
+				id:        ID,
+				typId:     NRW,
+				cgnode:    h.cur_cgnode,
+				parent_id: parent_node.id,
+				gid:       h.cur_tid,
+			}
+			g.updateNodes(prev_node, cur_node, false)
+		} else { // when prev_node is a read/write node
+			cur_node = prev_node
+		}
+		// update maps in rfgplus
+		rwn.n = cur_node
+		cur_node.rws = append(cur_node.rws, rwn)
+		g.rfgplus.UpdateRecords(rwn.pts, rwn)
+
+		g.inst2rwnode[instr] = rwn
+		ID_RW++
+
+		if DEBUG_RW {
+			fmt.Printf("inst: %s\n\t%v\n", rwn.inst, rwn.pts)
+		}
+
+		return cur_node
+	}
+
+	return nil
+}
+
+///////////////////////////////////// the following is for detecting blocking bugs //////////////////////////////////////
 
 // detectionState to maintain each possible state during the traversal by DFSBB
 // this is also the result of a state exploration
@@ -1983,6 +2698,11 @@ func (h *detectionState) noPausedIsWalkable() bool {
 			return false
 		}
 	}
+	//for _, pause_id := range h.pause_ats {
+	//	if can, ok := h.can_walk[pause_id]; ok && can {
+	//		return false
+	//	}
+	//}
 	return true
 }
 
@@ -2142,28 +2862,15 @@ func (g *RFGraph) onlyICanWalk(cur_tid int, ds *detectionState) bool {
 		if cur_tid == tid || paused_id == -2 || paused_id == -1 { // -1 means no-exit loop or the current visiting goroutine
 			continue
 		}
+		//typ := g.id2node[paused_id].typId
+		//if typ != NLock && typ != NRLock && typ != NGoroutine {
+		//	continue
+		//}
 		return false
 	}
 
 	fmt.Printf(" - only i can walk: tid = %d\n", cur_tid)
 	return true
-}
-
-// isDuplicateState return true if we have this state already
-func (g *RFGraph) isDuplicateState(state *detectionState) bool {
-	// if the last two nodes in a state repeat, it's dead ... don't explore again
-	// e.g., moby4951
-	if hasRepeatState(state.splitting_points) {
-		return true
-	}
-
-	for _, s := range g.states {
-		if IntArrayContains(s.splitting_points, state.splitting_points) ||
-			IntMapContains(s.pairs, state.pairs) {
-			return true
-		}
-	}
-	return false
 }
 
 // visitNode return whether we continue the traversal on this thread
@@ -2208,11 +2915,12 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 			_ds.can_walk[consumer.id] = true
 			_ds.start_node_id = matched_producer_id
 			_ds.start_tid = cur_tid
-			// new state expr starting from the next node of cur_node, since cur_node already visited here
+			//g.exploreState(_ds, matched_producer_id, cur_tid) // starting from the next node of cur_node, since cur_node already visited here
 		}
 	}
 
 	// create a new state for lock that already taken by other threads, e.g., etcd6873
+	// TODO: still many states for Hugo5739
 	createNewLockState := func(lock *Node, pts []int, held *Node) {
 		_ds := ds.copy(cur_node.id)
 		if g.isDuplicateState(_ds) {
@@ -2233,6 +2941,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 		}
 		_ds.start_node_id = lock.id
 		_ds.start_tid = cur_tid
+		//g.exploreState(_ds, lock.id, cur_tid)
 	}
 
 	markConsumerAfterMatching := func(consumer *Node, matched_producer_id int) {
@@ -2253,6 +2962,12 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 			// we did not find match when last time visits the select
 			ds.visited[consumer.case_sel.id] = 1 // mark it visited and matched
 		}
+		//if consumer.typId == NCaseDone {
+		//	// if context.cancel gets matched with case ctx.Done(),
+		//	// delay the visit of ctx.Done()
+		//	fmt.Printf(" -- delay the visit of ctx.Done(): %s\n", consumer.String())
+		//	ds.visit_last[consumer.gid] = consumer.id
+		//}
 	}
 
 	// match consumer with a specific producer
@@ -2465,7 +3180,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 		//     if multiple senders and is possible, pick the sender without a consumer; otherwise, create a new state for each
 		// TODO: what if multiple cases leading to return/exit of loop?
 		//       we need to explore all of them, see which other case channels will be blocked
-		//   if cur_node.is_in_loop {   && c.case_to_end { // marked by one of its producer
+		//   if cur_node.is_in_for_loop {   && c.case_to_end { // marked by one of its producer
 		// normal cases
 		found_producer := false // this is a consumer op, and we already have its matched producer in ds.pairs
 		found_consumer := false // vice versa
@@ -2487,7 +3202,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 					_ds.can_walk[c.id] = true // inform the producer in a new state
 					_ds.start_node_id = c.id
 					_ds.start_tid = cur_tid
-					// new state expr we already visit this case, starting from its kid
+					//g.exploreState(_ds, c.id, cur_tid) // we already visit this case, starting from its kid
 					continue
 				}
 				// take default
@@ -2516,7 +3231,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 					_ds.can_walk[producer_id] = true // inform the producer in a new state
 					_ds.start_node_id = c.id
 					_ds.start_tid = cur_tid
-					//  new state expr: we already visit this case, starting from its kid
+					//g.exploreState(_ds, c.id, cur_tid) // we already visit this case, starting from its kid
 				}
 				continue
 			}
@@ -2538,7 +3253,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 					g.states = append(g.states, _ds)
 					_ds.start_node_id = c.id
 					_ds.start_tid = cur_tid
-					// new state expr: we already visit this case, starting from its kid
+					//g.exploreState(_ds, c.id, cur_tid) // we already visit this case, starting from its kid
 					continue
 				}
 				found_consumer = true
@@ -2675,6 +3390,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 
 		// pause at each lock when multiple threads have locks, try to trigger a state with deadlock
 		// will come back after another thread obtains another lock.
+		// TODO: if no other thread is using lock, then why do you need a lock at first ...
 		pauseHere(cur_node.id)
 		break
 
@@ -2727,7 +3443,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 			break
 		} else if rheld != nil && rheld.gid == cur_tid {
 			// current goroutine is holding the rlock, maybe a revisit of this rlock or held by other rlock
-			// this is not encouraged
+			// TODO: but not encouraged
 			doubles := ds.doublelock[cur_tid]
 			if doubles != nil {
 				// if another goroutine is waiting to hold a wlock, block here
@@ -2943,7 +3659,7 @@ func (g *RFGraph) visitNode(cur_node *Node, ds *detectionState) bool {
 		}
 
 		// if calls defer wg.Done() and all spawned goroutine completes, inform wg.Wait()
-		if len(cur_node.wg_pts) > 0 {
+		if cur_node.isWGDone {
 			matchWGDone()
 		}
 		break
@@ -3287,7 +4003,7 @@ func (g *RFGraph) DFSDetectBlockingBugs() {
 
 	// rough filter out result
 	fmt.Println("\n\n*********************************** ")
-	fmt.Println("Filtering Result ... ")
+	fmt.Println("Filtering Result: ")
 	for _, s := range results {
 		if s.noPaused() && len(s.visit_loops) == 0 { // only print out the state when blocking bugs have been detected
 			continue
@@ -3316,7 +4032,7 @@ func (g *RFGraph) DFSDetectBlockingBugs() {
 
 	if DEBUG_EACH_RESULT { // print out result immediately without removing redundancy
 		fmt.Println("\n\n*********************************** ")
-		fmt.Println("Detection Result: ")
+		fmt.Println("Detection Result (Blocking bugs): ")
 		for i, s := range results {
 			if s.noPaused() && len(s.visit_loops) == 0 { // only print out the state when blocking bugs have been detected
 				continue
@@ -3373,6 +4089,21 @@ func (g *RFGraph) DFSDetectBlockingBugs() {
 					fmt.Printf("Cannot exit the %s\n-> Statement %s\n@Location %s\npaused at\n-> Statement %s\n@Location %s\n\n", loop_name, stmt, loc, stmt2, loc2)
 				}
 			}
+
+			//// bz: the following are intermediate results
+			//fmt.Println("-----------------------------------------")
+			//fmt.Println("Detection Result (double locks): ")
+			//for _, d := range s.doublelock {
+			//	fmt.Printf("%s@tid = %d; %s@tid = %d", d[0], d[0].gid, d[1], d[1].gid)
+			//}
+			//for _, d := range s.twolock {
+			//	fmt.Printf("%s@tid = %d; %s@tid = %d", d[0], d[0].gid, d[1], d[1].gid)
+			//}
+			//fmt.Println("-----------------------------------------")
+			//fmt.Println("Detection Result (double locks): ")
+			//for _, d := range s.triplelocks {
+			//	fmt.Printf("%s@tid = %d; %s@tid = %d; %s@tid = %d", d[0], d[0].gid, d[1], d[1].gid, d[2], d[2].gid)
+			//}
 		}
 
 		if len(g.cferrs) == 0 {
@@ -3380,7 +4111,7 @@ func (g *RFGraph) DFSDetectBlockingBugs() {
 			return
 		}
 		fmt.Println("\n\n*********************************** ")
-		fmt.Println("Detection Result (Unexpected Exit of Control Flow): ")
+		fmt.Println("Detection Result (Unexpected Exit of Controlflow): ")
 		pos2err := make(map[token.Pos]*CFError)
 		for _, err := range g.cferrs { // filter out redundant errs
 			if _, ok := pos2err[err.inst_pos]; ok {
@@ -3406,9 +4137,9 @@ func (g *RFGraph) DFSDetectBlockingBugs() {
 				stmt, loc, stmt2, loc2)
 			fmt.Println("-----------------------------------------")
 		}
-
-		fmt.Println("\n\n*********************************** ")
 	}
+
+	fmt.Println("\n\n*********************************** ")
 }
 
 func (g *RFGraph) findWhereLoopPausedAt(tid int, loop_enter *Node, ds *detectionState) *Node {
@@ -3511,6 +4242,37 @@ func (g *RFGraph) getSourceCode(pos token.Pos) (token.Position, string) {
 	loc := g.prog.Fset.Position(pos)
 	stmt, _ := getLineNumber(loc.Filename, loc.Line)
 	return loc, stmt
+
+	//for lineNum := rwPos.Line - 3; lineNum <= rwPos.Line+3; lineNum++ {
+	//	theLine, _ := getLineNumber(rwPos.Filename, lineNum)
+	//	if lineNum == rwPos.Line {
+	//tabs := len(theLine) - len(strings.TrimLeftFunc(theLine, unicode.IsSpace))
+	//spaces := rwPos.Column - tabs
+
+	//// top pointer
+	//if spaces > 0 && strings.TrimLeftFunc(theLine, unicode.IsSpace)[spaces-1:spaces] == "[" {
+	//	log.Info("\t", strings.Repeat(" ", int(math.Log10(float64(rwPos.Line)))+1), strings.Repeat("\t", tabs), strings.Repeat(" ", spaces), "v")
+	//} else if spaces > 0 {
+	//	log.Info("\t", strings.Repeat(" ", int(math.Log10(float64(rwPos.Line)))+1), strings.Repeat("\t", tabs), strings.Repeat(" ", spaces-1), "v")
+	//} else if spaces == 0 {
+	//	log.Info("\t", strings.Repeat(" ", int(math.Log10(float64(rwPos.Line)))+1), strings.Repeat("\t", tabs), "v")
+	//}
+
+	//log.Info("\t", rwPos.Line, "|", theLine)
+
+	//// bottom pointer
+	//if spaces > 0 && strings.TrimLeftFunc(theLine, unicode.IsSpace)[spaces-1:spaces] == "[" {
+	//	log.Info("\t", strings.Repeat(" ", int(math.Log10(float64(rwPos.Line)))+1), strings.Repeat("\t", tabs), strings.Repeat(" ", spaces), "^")
+	//} else if spaces > 0 {
+	//	log.Info("\t", strings.Repeat(" ", int(math.Log10(float64(rwPos.Line)))+1), strings.Repeat("\t", tabs), strings.Repeat(" ", spaces-1), "^")
+	//} else if spaces == 0 {
+	//	log.Info("\t", strings.Repeat(" ", int(math.Log10(float64(rwPos.Line)))+1), strings.Repeat("\t", tabs), "^")
+	//}
+
+	//} else {
+	//	log.Info("\t", lineNum, "|", theLine)
+	//}
+	//}
 }
 
 func getLineNumber(filePath string, lineNum int) (string, error) {
@@ -3537,13 +4299,17 @@ func getLineNumber(filePath string, lineNum int) (string, error) {
 // TODO: select.done here might need other handling
 func getCaseBBs(select_bb *ssa.BasicBlock, h *creatorHelper, is_blocking bool) map[int][]*ssa.BasicBlock {
 	// find all "select.body" for cases
+	visited := make(map[*ssa.BasicBlock]bool) // replace h.skips to record visited bbs TODO: check if affecting the behavior of blocking bug detection
+	for bb, b := range h.skips {              // copy h.skips
+		visited[bb] = b
+	}
 	stack := make([]*ssa.BasicBlock, 1)
 	bodies := make([]*ssa.BasicBlock, 0) // "select.body", we may see empty body in test cases
 	stack[0] = select_bb
 	for len(stack) > 0 {
 		s := stack[0]
 		stack = stack[1:] // pop
-		h.skips[s] = true
+		visited[s] = true
 		// this might be the last select.next block, which can be panic block or default block
 		if s.Comment == "select.next" || s.Comment == "select.done" {
 			l := len(s.Instrs)
@@ -3556,7 +4322,9 @@ func getCaseBBs(select_bb *ssa.BasicBlock, h *creatorHelper, is_blocking bool) m
 			} else if !is_blocking {
 				// has and is default block, which is the last bb to collect
 				bodies = append(bodies, s)
-				continue
+				if select_bb != s { // e.g., kubernetes82239: two select insides a loop
+					continue
+				}
 			}
 		}
 
@@ -3589,15 +4357,23 @@ func getCaseBBs(select_bb *ssa.BasicBlock, h *creatorHelper, is_blocking bool) m
 		tmp := make([]*ssa.BasicBlock, 1)
 		tmp[0] = body
 
+		if body.Comment == "select.next" {
+			// e.g., kubernetes82239 where select follow with another select inside a loop.
+			// check func JitterUntil(f func(), stopCh <-chan struct{}) for the IR
+			// here to avoid the recursive visit of the statements in the loop
+			case_bodies[i] = tmp
+			continue
+		}
+
 		// successors
 		succs := body.Succs
 		for len(succs) > 0 {
 			succ := succs[0]
 			succs = succs[1:] // pop
-			if succ.Index > select_bb.Index && !h.skips[succ] {
+			if succ.Index > select_bb.Index && !visited[succ] {
 				// visit here, only move forward: when bb idxes become larger
 				// if jump back, it is the end of current case
-				h.skips[succ] = true
+				visited[succ] = true
 				tmp = append(tmp, succ)
 				if succ.Comment == "select.done" {
 					continue // current select finishes here
@@ -3628,33 +4404,66 @@ func getCaseBBs(select_bb *ssa.BasicBlock, h *creatorHelper, is_blocking bool) m
 	return case_bodies
 }
 
-// getROCBBs for ROC: collect all bbs inside a ROC loop
-func getROCBBs(roc_bb *ssa.BasicBlock, h *creatorHelper) []*ssa.BasicBlock {
-	body := roc_bb.Succs[0] // one is "rangechan.body", the other is "rangechan.done"
-	if body.Comment != "rangechan.body" {
-		body = roc_bb.Succs[1]
+// getLoopBBs: collect all bbs inside a range loop, e.g., ROC
+// including (the bb's order is fixed):
+// rangechan.loop, rangechan.body, rangechan.done
+// rangeindex.loop, rangeindex.body, rangeindex.done
+// rangeiter.loop, rangeiter.body, rangeiter.done
+// NOTE:
+// for "for" loop:
+// for.body, for.done, for.loop
+// where for.done and for.loop can be absent.
+// NOTE: for.done is NOT in the loop body, be careful when using this function to find all bbs inside a loop
+//
+// for all above cases, "xxx.body" contains the statements inside the loop
+func getLoopBBs(start_bb *ssa.BasicBlock, h *creatorHelper) []*ssa.BasicBlock {
+	visited := make(map[*ssa.BasicBlock]bool) // replace h.skips to record visited bbs TODO: check if affecting the behavior of blocking bug detection
+	for bb, b := range h.skips {              // copy h.skips
+		visited[bb] = b
 	}
-	h.skips[body] = true
-	ret := make([]*ssa.BasicBlock, 1)
-	ret[0] = body
+
+	// logic starts here
+	body := start_bb.Succs[0]           // one is "rangexxx.body", the other is "rangexxx.done"
+	if start_bb.Comment != "for.body" { // this only works for "rangexxx.body", not for "for" loops
+		if !(body.Comment[:5] == "range" && body.Comment[len(body.Comment)-5:] == ".body") {
+			body = start_bb.Succs[1]
+		}
+	}
+	visited[body] = true
+	var ret []*ssa.BasicBlock
+	if start_bb.Comment == "for.body" {
+		ret = append(ret, start_bb) // include
+	}
+	ret = append(ret, body)
 
 	// successors
 	succs := body.Succs
 	for len(succs) > 0 {
 		succ := succs[0]
-		succs = succs[1:]              // pop
-		if succ.Comment == "recover" { // skip
+		succs = succs[1:]                                            // pop
+		if succ.Comment == "recover" || succ.Comment == "for.done" { // skip
 			continue
 		}
-		if succ.Index > roc_bb.Index && !h.skips[succ] {
+		if succ.Index > start_bb.Index && !visited[succ] {
 			// visit here, only move forward: when bb idxes become larger
-			// if jump back, it is the end of current case
-			h.skips[succ] = true
+			// if jump back, it is the end of current range code block
+			// will eventually jump back to "rangexxx.loop"
+			// for "for" loop, it will eventually jump back to "for.body"
+			visited[succ] = true
 			ret = append(ret, succ)
 			succs = append(succs, succ.Succs...) // push
 		}
 	}
 
+	if DEBUG {
+		fmt.Printf("** loop @ bb = %d: include bb = ", start_bb.Index)
+		for _, bb := range ret {
+			fmt.Printf("%d, ", bb.Index)
+		}
+		fmt.Println()
+	}
+
+	//ret = append(ret, start_bb.Succs[1]) // append the last bb of roc
 	return ret
 }
 
@@ -3666,4 +4475,276 @@ func indexOf(slice []int, element int) int {
 		}
 	}
 	return -1
+}
+
+///////////////////////////////////// the following is for detecting data race //////////////////////////////////////
+
+func (g *RFGraph) PrintRFGPlus() {
+	fmt.Println("\n\n*********************************** ")
+	if len(g.syncAdjList) == 0 {
+		fmt.Println("No RFGPlus. ")
+	} else {
+		fmt.Println("Printing RFGPlus (no thread-related edges): ")
+		for parent, kids := range g.syncAdjList {
+			fmt.Printf("%s ->\n", parent.String())
+			for _, kid := range kids {
+				fmt.Printf("\t%s\n", kid.String())
+			}
+		}
+		fmt.Printf("#RFGPlus edges = %d\n", g.rfgplus.size_edge)
+		fmt.Printf("#RFGPlus nodes = %d\n", g.rfgplus.size_node)
+	}
+
+	if len(g.gid2nloop) == 0 {
+		fmt.Println("\nNo nodes that can happen-in-parallel with goroutines.")
+	} else {
+		fmt.Println("\nPrinting nodes that can happen-in-parallel with goroutines: ")
+		for gid, nloop := range g.gid2nloop {
+			fmt.Printf("tid = %d: ", gid)
+			for l, r := range nloop {
+				fmt.Printf("[%d->%d], ", l, r)
+			}
+			fmt.Println()
+		}
+	}
+}
+
+func (g *RFGraph) AddHappenBeforeEdges() {
+	// Create a map to keep track of visited nodes
+	visited := make(map[*Node]bool)
+	// Start BFS traversal from the root node (aka main)
+	// TODO: now we skip the check of whether
+	//   (1) two nodes can happen-in-parallel and (2) they have common lockset
+	//   hope this BFS will solve happen-in-parallel check
+	root := g.roots[0]
+
+	// Create a queue for BFS and enqueue the start node
+	queue := []*Node{root}
+
+	// Mark the start node as visited
+	visited[root] = true
+
+	addEdge := func(pts []int, src *Node) {
+		for _, obj := range pts {
+			if pcs, ok := g.resources[obj]; ok {
+				for _, dst := range pcs.consumers {
+					g.syncAdjList[src] = append(g.syncAdjList[src], dst)
+				}
+			}
+		}
+	}
+
+	for len(queue) > 0 {
+		// Dequeue a vertex from the queue
+		cur_node := queue[0]
+		queue = queue[1:]
+
+		// check if needs to add new edges
+		switch cur_node.typId {
+		case NChannel: // these edges from the same channel send may or may not exist at the same time
+			if cur_node.isSender {
+				pts := g.getPTS(cur_node.ch_ptr, cur_node.cgnode)
+				addEdge(pts, cur_node)
+			}
+		case NClose:
+			pts := g.getPTS(cur_node.ch_ptr, cur_node.cgnode)
+			addEdge(pts, cur_node)
+		case NCancel: // for context
+			// these edges from the same cancel send may or may not exist at the same time
+			obj := cur_node.p.base_obj
+			if pcs, ok := g.resources[obj]; ok {
+				for _, dst := range pcs.consumers {
+					g.syncAdjList[cur_node] = append(g.syncAdjList[cur_node], dst)
+				}
+			}
+		case NWGDone:
+			addEdge(cur_node.wg_pts, cur_node)
+		case NExit:
+			if cur_node.isWGDone {
+				addEdge(cur_node.wg_pts, cur_node)
+			}
+		case NSignal: // these edges from the same channel send should not exist at the same time
+			pts := g.getPTS(cur_node.cond_ptr, cur_node.cgnode)
+			addEdge(pts, cur_node)
+		case NBroadcast:
+			pts := g.getPTS(cur_node.cond_ptr, cur_node.cgnode)
+			addEdge(pts, cur_node)
+		default:
+		}
+
+		// Get all adjacent vertices of the dequeued node
+		// If an adjacent node has not been visited, mark it as visited and enqueue it
+		for _, neighbor := range g.adjList[cur_node] {
+			if !visited[neighbor] {
+				visited[neighbor] = true
+				queue = append(queue, neighbor)
+			}
+		}
+	}
+
+	// collect size of rfgplus
+	g.rfgplus.size_node += len(g.syncAdjList)
+	for _, kids := range g.syncAdjList {
+		g.rfgplus.size_edge += len(kids)
+	}
+	g.rfgplus.size_node += g.rfgplus.size_edge
+
+	if DEBUG || DEBUG_GRAPH { // print out cshb graph
+		g.PrintRFGPlus()
+	}
+}
+
+// DFSCanReach use DFS for happens-before relation; return true if happens-before relation exists
+// TODO: due to the hb edges that may or may not exist at the same time, we can have the condition that
+//  when traverse from one path, a can reach b; however, a cannot reach b from another path, e.g.,
+//  ch send -(1)->
+//   write          ch receive
+//  ch send -(2)->
+//                    write
+//  where (1) has no hb, while (2) has hb between the two writes
+//  this is because of pointer analysis that makes one of the pts(ch) has a false instance
+//  For now, as long as there is one path leading to no hb (false), we report race -> *not implement yet*
+//  Better solution?
+//  (1) statistics: collect the average size of pts for channel variables, if <2, we can ignore the possible false positive
+func (g *RFGraph) DFSCanReach(a, b *RWNode) bool {
+	// cache the result in this string format:
+	// key: <small node id + big node id> -> value: true/false
+	key := ""
+	if a.n.id > b.n.id {
+		key = fmt.Sprintf("%d-%d", b.n.id, a.n.id)
+	} else {
+		key = fmt.Sprintf("%d-%d", a.n.id, b.n.id)
+	}
+
+	// if the given key exists in the cache.
+	if val, ok := g.cache[key]; ok {
+		return val
+	}
+
+	// check hb relation for go spawned in loops
+	if g.CheckGoInLoops(a, b) {
+		g.cache[key] = false
+		return false
+	}
+
+	// start traversal
+	visited := make(map[*Node]bool)
+	ret := g.DFSVisit(a.n, b.n, visited)
+	if ret { // only cache if true here
+		g.cache[key] = ret
+		return ret
+	}
+
+	// clear visit and traverse again
+	visited = make(map[*Node]bool)
+	ret = g.DFSVisit(b.n, a.n, visited)
+	g.cache[key] = ret
+	return ret
+}
+
+// CheckGoInLoops determine hb relation of nodes created by goroutines spawned in a loop and loop body
+// return true if happens-before relation DOES NOT exist;
+// return false means not sure of HB yet
+// (i.e., we can find a node id in the range indicate by gid2nloop)
+func (g *RFGraph) CheckGoInLoops(a, b *RWNode) bool {
+	a_gid := a.n.gid
+	b_gid := b.n.gid
+	if nloop, ok := g.gid2nloop[a_gid]; ok {
+		for l, r := range nloop {
+			if l <= b.n.id && b.n.id <= r {
+				return true
+			}
+		}
+	}
+	if nloop, ok := g.gid2nloop[b_gid]; ok {
+		for l, r := range nloop {
+			if l <= a.n.id && a.n.id <= r {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// DFSVisit return true if happens-before relation exists
+func (g *RFGraph) DFSVisit(src, dest *Node, visited map[*Node]bool) bool {
+	if src == dest {
+		return true
+	}
+
+	// Mark the start node as visited
+	visited[src] = true
+
+	// Traverse all adjacent nodes
+	if flags.Plus {
+		// check sync primitive adj first
+		for _, neighbor := range g.syncAdjList[src] {
+			if !visited[neighbor] {
+				if g.DFSVisit(neighbor, dest, visited) {
+					return true
+				}
+			}
+		}
+	}
+
+	if src.typId == NSelect { // cases are the kids of select stmt, handle this first
+		for _, c := range src.cases {
+			if c != nil && !visited[c] {
+				if g.DFSVisit(c, dest, visited) {
+					return true
+				}
+			}
+		}
+	}
+
+	for _, neighbor := range g.adjList[src] {
+		if !visited[neighbor] {
+			if g.DFSVisit(neighbor, dest, visited) {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// CollectSamePTSInSyncRange report how many rwnodes in a sync range have the same pts
+// exclude from performance
+func (g *RFGraph) CollectSamePTSInSyncRange() (int, int) {
+	node_with_same_pts := make([]*Node, 0)
+	node_with_empty_pts := make([]*Node, 0)
+	for _, node := range g.id2node {
+		if node.typId != NRW {
+			continue
+		}
+
+		if DEBUG { // debug
+			for _, rwnode := range node.rws {
+				fmt.Printf("%s %v\n", rwnode.inst, rwnode.pts)
+			}
+			fmt.Println()
+		}
+
+		same := true
+		prev_pts := make([]int, 0)
+		for _, rwnode := range node.rws {
+			if len(prev_pts) == 0 {
+				prev_pts = rwnode.pts
+				continue
+			}
+			if IntArrayEquals(prev_pts, rwnode.pts) {
+				continue
+			} else {
+				same = false
+				break
+			}
+		}
+		if same {
+			if len(prev_pts) == 0 {
+				node_with_empty_pts = append(node_with_empty_pts, node)
+			}
+			node_with_same_pts = append(node_with_same_pts, node)
+		}
+	}
+	return len(node_with_same_pts), len(node_with_empty_pts)
 }

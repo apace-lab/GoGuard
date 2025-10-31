@@ -3,9 +3,9 @@ package myutil
 import (
 	"flag"
 	"fmt"
+	"github.com/bozhen-liu/gopa/flags"
 	"github.com/bozhen-liu/gopa/go/callgraph"
 	"github.com/bozhen-liu/gopa/go/myutil/compare"
-	"github.com/bozhen-liu/gopa/go/myutil/flags"
 	"github.com/bozhen-liu/gopa/go/packages"
 	"github.com/bozhen-liu/gopa/go/pointer"
 	default_algo "github.com/bozhen-liu/gopa/go/pointer_default"
@@ -19,22 +19,6 @@ import (
 )
 
 //bz: utility functions and var declared for my use
-// some package names for git repos:
-// "google.golang.org/grpc"
-// "github.com/pingcap/tidb"
-// "k8s.io/kubernetes"
-// "github.com/ethereum/go-ethereum"
-
-var excludedPkgs = []string{ //bz: excluded a lot of default constraints -> only works if a.config.Level == 1 or turn on DoCallback (check a.createForLevelX() for details)
-	//"runtime",
-	//"reflect", -> only consider when turn on a.config.Reflection or analyzing tests
-	//"os",
-
-	//bz: check /_founds/sum.md for the following exclusions -> create too many interface related type of pointers with pts > 100
-	"fmt",
-	"errors", //there are so many wrappers of errors ...
-}
-
 var scopePkgs = []string{ // considered function sig
 	"context.WithCancel", // TODO:  context.cancelCtx
 	"context.WithTimeout",
@@ -174,7 +158,7 @@ func DoSeq(mains []*ssa.Package) (map[*ssa.Package]*pointer.Result, map[*ssa.Pac
 	var logfile *os.File
 	var err error
 	if flags.DoLog { //create my log file
-		loc := "/Users/bozhen/Documents/GoCon/gopa/_logs/my_log_hugo5379.txt"
+		loc := "/Users/bozhenliu/Documents/Go/gopa/_logs/my_log_grpc-go0-0.txt"
 		//loc := "/Users/bozhenliu/Documents/Go/gopa/_logs/my_log_kubernetes70277.txt"
 		logfile, err = os.Create(loc)
 		fmt.Println("Generate log @ " + loc)
@@ -198,11 +182,11 @@ func DoSeq(mains []*ssa.Package) (map[*ssa.Package]*pointer.Result, map[*ssa.Pac
 		Origin: true, //origin
 		//shared config
 		K:          1,
-		LimitScope: true,         //bz: only consider app methods now -> no import will be considered
-		DEBUG:      false,        //bz: rm all printed out info in console
-		Scope:      scopePkgs,    // bz: consider context
-		Exclusion:  excludedPkgs, //bz: copied from race_checker if any
-		TrackMore:  true,         //bz: track pointers with all types
+		LimitScope: true,               //bz: only consider app methods now -> no import will be considered
+		DEBUG:      false,              //bz: rm all printed out info in console
+		Scope:      scopePkgs,          // bz: consider context
+		Exclusion:  flags.ExcludedPkgs, //bz: copied from race_checker if any
+		TrackMore:  true,               //bz: track pointers with all types
 	}
 
 	start := time.Now()                                              //performance
@@ -262,10 +246,10 @@ func doSameRootMy(mains []*ssa.Package) *pointer.Result {
 		Origin: true, //origin
 		//shared config
 		K:          1,
-		LimitScope: true,         //bz: only consider app methods now -> no import will be considered
-		DEBUG:      false,        //bz: rm all printed out info in console
-		Exclusion:  excludedPkgs, //bz: copied from race_checker if any
-		TrackMore:  true,         //bz: track pointers with all types
+		LimitScope: true,               //bz: only consider app methods now -> no import will be considered
+		DEBUG:      false,              //bz: rm all printed out info in console
+		Exclusion:  flags.ExcludedPkgs, //bz: copied from race_checker if any
+		TrackMore:  true,               //bz: track pointers with all types
 	}
 
 	//*** compute pta here
@@ -440,11 +424,11 @@ func DoEachMainMy(i int, main *ssa.Package) *pointer.ResultWCtx {
 		//CallSiteSensitive: true, //kcfa
 		Origin: true, //origin
 		//shared config
-		K:          1,            //bz: how many level of origins? default = 1
-		LimitScope: true,         //bz: only consider app methods now -> no import will be considered
-		DEBUG:      false,        //bz: rm all printed out info in console
-		Exclusion:  excludedPkgs, //bz: copied from race_checker if any
-		TrackMore:  true,         //bz: track pointers with types declared in Analyze Scope
+		K:          1,                  //bz: how many level of origins? default = 1
+		LimitScope: true,               //bz: only consider app methods now -> no import will be considered
+		DEBUG:      false,              //bz: rm all printed out info in console
+		Exclusion:  flags.ExcludedPkgs, //bz: copied from race_checker if any
+		TrackMore:  true,               //bz: track pointers with types declared in Analyze Scope
 	}
 
 	//*** compute pta here

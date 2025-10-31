@@ -9,7 +9,7 @@ package pointer
 
 import (
 	"fmt"
-	"github.com/bozhen-liu/gopa/go/myutil/flags"
+	"github.com/bozhen-liu/gopa/flags"
 	"go/types"
 )
 
@@ -170,10 +170,9 @@ func (a *analysis) solveLimit() {
 			skipIDs[x] = x
 			n.solve.prevPTS.Clear()
 			continue
-		}else {
+		} else {
 			n.solve.prevPTS.Copy(&n.solve.pts.Sparse)
 		}
-
 
 		// Apply all resolution rules attached to n.
 		a.solveConstraints(n, &delta)

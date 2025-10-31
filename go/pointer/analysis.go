@@ -8,7 +8,7 @@ package pointer
 
 import (
 	"fmt"
-	"github.com/bozhen-liu/gopa/go/myutil/flags"
+	"github.com/bozhen-liu/gopa/flags"
 	"go/token"
 	"go/types"
 	"io"
@@ -279,6 +279,13 @@ func (a *analysis) enclosingObj(id nodeid) nodeid {
 			return i
 		}
 	}
+	// bz: this is a tmp solution, since global var's obj has larger id than its var
+	for i := id; i < nodeid(len(a.nodes)); i++ {
+		n := a.nodes[i]
+		if obj := n.obj; obj != nil {
+			return i
+		}
+	}
 	panic("node has no enclosing object") //bz: this panics when including global, so ... do not panic?
 }
 
@@ -534,20 +541,20 @@ func AnalyzeMultiMains(config *Config) (results map[*ssa.Package]*Result, _resul
 	} else {
 		fmt.Println(" *** Multiple Mains **************** ")
 	}
+	if flags.RangeL != -1 && flags.RangeR != -1 {
+		fmt.Printf(" *** Pkg Range [%d:%d] **************** \n", flags.RangeL, flags.RangeR)
+	} else {
+		fmt.Println(" *** No Pkg Range: All ************* ")
+	}
 
 	for i, main := range config.Mains { //analyze mains
-		//if i >= 3 {
-		//	break
-		//}
-		//if i >= 60 { // i == 10, i >= 20
-		//	break
-		//}
-		//if i < 50 {
-		//	continue
-		//}
-		//if strings.Contains(main.String(), "/tpl") { // hugo
-		//	continue
-		//}
+		if flags.RangeL != -1 && flags.RangeR != -1 {
+			if i < flags.RangeL {
+				continue
+			} else if i > flags.RangeR {
+				break
+			}
+		} // else do all pkgs
 
 		//create a config
 		var _mains []*ssa.Package

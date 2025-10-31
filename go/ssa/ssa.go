@@ -1587,6 +1587,9 @@ func (v *FieldAddr) Operands(rands []*Value) []*Value {
 	return append(rands, &v.X)
 }
 
+// Referrers bz: add for convenience
+func (v *FieldAddr) Referrers() *[]Instruction { return &v.register.referrers }
+
 func (s *If) Operands(rands []*Value) []*Value {
 	return append(rands, &s.Cond)
 }

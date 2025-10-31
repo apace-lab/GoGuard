@@ -7,6 +7,23 @@ import (
 	"sort"
 )
 
+func HasCommonIntArray(a []int, b []int) bool {
+	elementSet := make(map[int]struct{})
+
+	for _, elem := range a {
+		elementSet[elem] = struct{}{}
+	}
+
+	// Check if any element of the second array is in the map
+	for _, elem := range b {
+		if _, found := elementSet[elem]; found {
+			return true
+		}
+	}
+
+	return false
+}
+
 func IntArrayEquals(a []int, b []int) bool {
 	if len(a) != len(b) {
 		return false

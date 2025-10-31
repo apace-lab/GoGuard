@@ -12,6 +12,7 @@ import (
 	"github.com/bozhen-liu/gopa/go/ssa"
 	"github.com/bozhen-liu/gopa/go/types/typeutil"
 	"go/token"
+	"go/types"
 	"io"
 	"os"
 	"strconv"
@@ -583,15 +584,57 @@ func (r *ResultWCtx) GetObjectByID(id int) *node {
 func (r *ResultWCtx) GetPTSByPtrID(id int) []int {
 	nid := nodeid(id)
 	n := r.a.nodes[nid]
-	ptr := PointerWCtx{a: r.a, n: nodeid(id), cgn: n.obj.cgn}
+	var ptr PointerWCtx
+	if n.obj == nil {
+		ptr = PointerWCtx{a: r.a, n: nodeid(id), cgn: nil}
+	} else {
+		ptr = PointerWCtx{a: r.a, n: nodeid(id), cgn: n.obj.cgn}
+	}
 	return ptr.PointsTo().GetPTS()
 }
 
 // GetPTSByObjID by an obj id which is also a pointer id, see caller for detail
 func (r *ResultWCtx) GetPTSByObjID(obj_id int) []int {
 	obj := r.GetObjectByID(obj_id)
-	ptr := PointerWCtx{a: r.a, n: nodeid(obj_id), cgn: obj.obj.cgn}
+	var ptr PointerWCtx
+	if obj.obj == nil {
+		ptr = PointerWCtx{a: r.a, n: nodeid(obj_id), cgn: nil}
+	} else {
+		ptr = PointerWCtx{a: r.a, n: nodeid(obj_id), cgn: obj.obj.cgn}
+	}
 	return ptr.PointsTo().GetPTS()
+}
+
+// GetGlobalVarID get nodeid of a global var as pts instead of querying its pts
+func (r *ResultWCtx) GetGlobalVarID(v *PointerWCtx) []int {
+	ret := make([]int, 1)
+	ret[0] = int(v.n)
+	return ret
+}
+
+// GetMultiDArrayObjs get the objs created for multi-dimensional array pointers
+// return all the dimensions of objs created for this multi-d array
+func (r *ResultWCtx) GetMultiDArrayObjs(obj_id int) []int {
+	ret := make([]int, 0)
+	obj := r.GetObjectByID(obj_id)
+	typ := obj.typ
+	finish := false
+	for !finish {
+		switch arr := typ.(type) {
+		case *types.Array:
+			// i am an array type, check my element
+			ret = append(ret, obj_id)
+			obj_id++
+			typ = arr.Elem()
+		case *types.Slice:
+			ret = append(ret, obj_id)
+			obj_id++
+			typ = arr.Elem()
+		default:
+			finish = true
+		}
+	}
+	return ret
 }
 
 //bz: for mine data
@@ -1254,7 +1297,9 @@ func (r *Result) GetResult() *ResultWCtx {
 // from a test analyzed by this r *Result
 func (r *Result) GetTests() map[*ssa.Function]*cgnode {
 	if r.a.isMain {
-		fmt.Println("This result is for the main entry:", r.a.config.Mains[0], ", not for a test. Return.")
+		if r.a.result.DEBUG {
+			fmt.Println("This result is for the main entry:", r.a.config.Mains[0], ", not for a test. Return.")
+		}
 		return nil
 	}
 

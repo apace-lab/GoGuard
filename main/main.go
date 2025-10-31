@@ -3,8 +3,8 @@ package main
 import (
 	"fmt"
 	"github.com/bozhen-liu/gopa/concurrency"
+	"github.com/bozhen-liu/gopa/flags"
 	"github.com/bozhen-liu/gopa/go/myutil"
-	"github.com/bozhen-liu/gopa/go/myutil/flags"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +21,9 @@ func _doMain(path string) {
 	//officially start
 	if flags.DoSeq { //AnalyzeMultiMains - default
 		_, _results := myutil.DoSeq(mains)
-		concurrency.DetectBugs(prog, _results)
+		if flags.DoRace || flags.DoBlocking {
+			concurrency.DetectBugs(prog, _results)
+		}
 		return
 	} else {
 		if flags.DoSameRoot {
@@ -70,7 +72,9 @@ func visitFile(fp string, fi os.DirEntry, err error) error {
 
 func main() {
 	flags.ParseFlags()
-	concurrency.InitialPerformance()
+	if flags.DoRace || flags.DoBlocking {
+		concurrency.InitialPerformance()
+	}
 
 	if flags.DoFolder != "" {
 		// command line: ./main -doSeq -doTests -doFolder=$path-to-your-folder
@@ -84,5 +88,7 @@ func main() {
 		// to run all tests and mains in grpc-go
 		_doMain("")
 	}
-	concurrency.Performance()
+	if flags.DoRace || flags.DoBlocking {
+		concurrency.Performance()
+	}
 }
